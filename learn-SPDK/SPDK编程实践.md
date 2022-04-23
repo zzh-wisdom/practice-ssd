@@ -1,0 +1,26 @@
+# SPDK编程
+
+User Guides
+<https://spdk.io/doc/>
+
+## 系统配置
+
+<https://spdk.io/doc/system_configuration.html>
+通常情况下，使用./script/setup.sh即可实现配置，更加高级的使用可以参考该文档。
+
+1. 设备用户权限
+2. 用户内存限制 `ulimit -l`
+
+## SPDK 库
+
+库链接：<https://spdk.io/doc/libraries.html>
+应用中使用到的函数，都要手动指定对应的链接库
+
+建议使用pkg-config
+<https://spdk.io/doc/pkgconfig.html>
+
+例如需要使用SPDK nvme库，通过以下命令查看依赖的库
+
+```shell
+PKG_CONFIG_PATH=/path/to/spdk/build/lib/pkgconfig pkg-config --libs spdk_nvme
+```
