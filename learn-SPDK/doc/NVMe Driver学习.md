@@ -13,7 +13,10 @@
 	- [4.5. 命名空间ns](#45-命名空间ns)
 	- [4.6. QPair操作](#46-qpair操作)
 	- [4.7. IO操作](#47-io操作)
+	- [其他特殊IO操作](#其他特殊io操作)
 	- [4.8. 编程步骤](#48-编程步骤)
+	- [其他接口汇总](#其他接口汇总)
+	- [使用spdk_nvme_ctrlr_cmd_io_raw 进行 deallocate](#使用spdk_nvme_ctrlr_cmd_io_raw-进行-deallocate)
 - [TODO](#todo)
 
 ## 1. 注意点
@@ -132,6 +135,7 @@ spdk_nvme_ctrlr_opts default:
 struct spdk_nvme_ctrlr *spdk_nvme_connect(const struct spdk_nvme_transport_id *trid,
 		const struct spdk_nvme_ctrlr_opts *opts,
 		size_t opts_size);
+int spdk_nvme_ctrlr_disconnect(struct spdk_nvme_ctrlr *ctrlr);
 ```
 
 连接到某个特定设备。
@@ -428,6 +432,8 @@ spdk_nvme_ctrlr_get_default_io_qpair_opts(ctrlr, &opts, sizeof(opts));
 ```cpp
 int
 spdk_nvme_ctrlr_connect_io_qpair(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_qpair *qpair)
+void spdk_nvme_ctrlr_disconnect_io_qpair(struct spdk_nvme_qpair *qpair);
+int spdk_nvme_ctrlr_reconnect_io_qpair(struct spdk_nvme_qpair *qpair);// 连接的状态下重新连接，尝试重新连接给定的 qpair。 此函数旨在在已连接但已进入失败状态的 qpairs 上调用，如 spdk_nvme_qpair_process_completions 或 spdk_nvme_ns_cmd_* 函数之一的返回值 -ENXIO 所示
 ```
 
 连接新创建的 I/O qpair。此函数执行新创建的 qpair 所需的任何连接活动。在调用spdk_nvme_ctrlr_alloc_io_qpair并在spdk_nvme_io_qpair_opts结构中将create_only标志设置为 true 后，应调用该函数。如果在已连接的 qpair 上执行此调用将失败。有关重新连接 qpair，请参阅spdk_nvme_ctrlr_reconnect_io_qpair。对于 TCP 和 RDMA 等结构，此函数实际上通过连接 qpair 的线路发送命令。对于 PCIe，此功能执行一些内部状态机操作。
@@ -548,20 +554,67 @@ int spdk_nvme_ctrlr_cmd_io_raw_with_md(struct spdk_nvme_ctrlr *ctrlr,
 				       spdk_nvme_cmd_cb cb_fn, void *cb_arg);
 ```
 
-向控制器发送IO命令。低级接口，且正确性不做检查。非线程安全
+向控制器发送IO命令。低级接口，且正确性不做检查。非线程安全。
+**注意**：在构建 nvme_command 时，不需要填写 PRP 列表/SGL 或 CID。 司机将为您处理这两个问题。
 
-**其他特殊IO操作**:
+### 其他特殊IO操作
 
 ```cpp
-spdk_nvme_ns_cmd_write_zeroes()
-spdk_nvme_ns_cmd_flush() // 相当于fence？
+spdk_nvme_ns_cmd_write_zeroes()  // 某些ssd不支持
+spdk_nvme_ns_cmd_flush() // 相当于fence
+int spdk_nvme_ctrlr_cmd_abort(struct spdk_nvme_ctrlr *ctrlr,
+			      struct spdk_nvme_qpair *qpair,
+			      uint16_t cid,
+			      spdk_nvme_cmd_cb cb_fn,
+			      void *cb_arg); // 中止之前提交的特定 NVMe 命令。
 ```
 
-TODO
-
 ```cpp
+// Write Uncorrectable 命令用于将逻辑块标记为无效。
+// 在此操作之后读取指定的逻辑块时，将返回失败并显示未恢复的读取错误状态。
+// 为了清除无效逻辑块状态，需要对这些逻辑块执行写操作。
+int spdk_nvme_ns_cmd_write_uncorrectable(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+		uint64_t lba, uint32_t lba_count,
+		spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+// 可以用来释放LBA
+// 这是一个方便的包装器，它将自动分配和构造正确的数据缓冲区。
+// 因此，范围不需要从固定内存中分配，可以放在堆栈上。
+// 如果需要更高性能、零拷贝版本的 DSM，只需使用 spdk_nvme_ctrlr_cmd_io_raw() 构建并提交原始命令。
+// 见最后的示例：用spdk_nvme_ctrlr_cmd_io_raw实现lba deallocate
+// 该命令的其他功能，主要用来向 SSD控制器指示数据范围的访问情况，便于控制器可以进行某些优化，暂忽略
 spdk_nvme_ns_cmd_dataset_management()
 ```
+
+A logical block is allocated when it is written with a Write or Write Uncorrectable command. A
+logical block may be deallocated using the Dataset Management command.
+
+> **TODO**: 有必要看一下 NVMe 规范，学习如何提交原始命令。
+
+```cpp
+int spdk_nvme_ns_cmd_copy(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+			  const struct spdk_nvme_scc_source_range *ranges,
+			  uint16_t num_ranges,
+			  uint64_t dest_lba,
+			  spdk_nvme_cmd_cb cb_fn,
+			  void *cb_arg);
+```
+
+将range中指定的LBA的范围，拷贝到dest_lba为起始位置的范围。这是一个方便的包装器，它将自动分配和构造正确的数据缓冲区。 因此，范围不需要从固定内存中分配，可以放在堆栈上。 如果需要更高性能、零拷贝版本的 SCC，只需使用 spdk_nvme_ctrlr_cmd_io_raw() 构建并提交原始命令。
+
+```cpp
+int spdk_nvme_ns_cmd_flush(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+			   spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+```
+
+flush命令用于将非易失写缓存中的内容持久化，同时将之前提交的命令全部应用。
+
+```cpp
+int spdk_nvme_ns_cmd_compare(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair, void *payload,
+			     uint64_t lba, uint32_t lba_count, spdk_nvme_cmd_cb cb_fn,
+			     void *cb_arg, uint32_t io_flags);
+```
+
+通过fuse操作可以实现，compare and write。
 
 #### 轮询完成
 
@@ -702,6 +755,118 @@ int32_t spdk_nvme_ctrlr_process_admin_completions(struct spdk_nvme_ctrlr *ctrlr)
 9. //命名空间不需要释放
 10. detach设备
 11. 释放环境env资源：spdk_env_fini
+
+### 其他接口汇总
+
+控制器选项opt相关的函数：
+
+```cpp
+void spdk_nvme_ctrlr_get_default_ctrlr_opts(struct spdk_nvme_ctrlr_opts *opts,
+		size_t opts_size);  // 获取默认选项
+const struct spdk_nvme_ctrlr_opts *spdk_nvme_ctrlr_get_opts(struct spdk_nvme_ctrlr *ctrlr); // 指定控制器的选项
+```
+
+NVMe 控制器相关：
+
+```cpp
+void spdk_nvme_ctrlr_set_remove_cb(struct spdk_nvme_ctrlr *ctrlr,
+				   spdk_nvme_remove_cb remove_cb, void *remove_ctx); // 重新设置控制器的删除回调
+int spdk_nvme_ctrlr_reset(struct spdk_nvme_ctrlr *ctrlr);   // 对 NVMe 控制器执行完全硬件重置。
+void spdk_nvme_ctrlr_prepare_for_reset(struct spdk_nvme_ctrlr *ctrlr);
+const struct spdk_nvme_ctrlr_data *spdk_nvme_ctrlr_get_data(struct spdk_nvme_ctrlr *ctrlr);
+
+bool spdk_nvme_ctrlr_is_log_page_supported(struct spdk_nvme_ctrlr *ctrlr, uint8_t log_page);
+bool spdk_nvme_ctrlr_is_feature_supported(struct spdk_nvme_ctrlr *ctrlr, uint8_t feature_code);
+
+// ns 也有类似的函数
+int spdk_nvme_ctrlr_cmd_set_feature(struct spdk_nvme_ctrlr *ctrlr,
+				    uint8_t feature, uint32_t cdw11, uint32_t cdw12,
+				    void *payload, uint32_t payload_size,
+				    spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+int spdk_nvme_ctrlr_cmd_get_feature(struct spdk_nvme_ctrlr *ctrlr,
+				    uint8_t feature, uint32_t cdw11,
+				    void *payload, uint32_t payload_size,
+				    spdk_nvme_cmd_cb cb_fn, void *cb_arg);
+uint64_t spdk_nvme_ctrlr_get_flags(struct spdk_nvme_ctrlr *ctrlr); // Get supported flags of the controller.
+const struct spdk_nvme_transport_id *spdk_nvme_ctrlr_get_transport_id(
+	struct spdk_nvme_ctrlr *ctrlr);
+```
+
+命名空间相关：
+
+```cpp
+uint32_t spdk_nvme_ctrlr_get_num_ns(struct spdk_nvme_ctrlr *ctrlr); // 获取最大的NSID，但在NVM 1.2以后，NSID不一定连续，所以这个函数变得不可靠了
+const struct spdk_nvme_ns_data *spdk_nvme_ns_get_data(struct spdk_nvme_ns *ns);
+uint32_t spdk_nvme_ns_get_id(struct spdk_nvme_ns *ns);
+struct spdk_nvme_ctrlr *spdk_nvme_ns_get_ctrlr(struct spdk_nvme_ns *ns);
+bool spdk_nvme_ns_is_active(struct spdk_nvme_ns *ns);
+uint32_t spdk_nvme_ns_get_max_io_xfer_size(struct spdk_nvme_ns *ns);
+uint32_t spdk_nvme_ns_get_sector_size(struct spdk_nvme_ns *ns);
+// returns the size of the data sector plus metadata.
+uint32_t spdk_nvme_ns_get_extended_sector_size(struct spdk_nvme_ns *ns);
+uint64_t spdk_nvme_ns_get_num_sectors(struct spdk_nvme_ns *ns);
+uint64_t spdk_nvme_ns_get_size(struct spdk_nvme_ns *ns);
+uint32_t spdk_nvme_ns_get_md_size(struct spdk_nvme_ns *ns);
+bool spdk_nvme_ns_supports_extended_lba(struct spdk_nvme_ns *ns);
+bool spdk_nvme_ns_supports_compare(struct spdk_nvme_ns *ns);
+// 确定读取释放块时返回的值。 如果解除分配的块返回 0，
+// 则解除分配命令可用作 write_zeroes 命令的更有效替代方法，尤其是对于大型请求。
+// 实验室的SSD都不支持，连 Write Zeroes Command 也不支持
+enum spdk_nvme_dealloc_logical_block_read_value spdk_nvme_ns_get_dealloc_logical_block_read_value(
+	struct spdk_nvme_ns *ns);
+// 获取给定命名空间的最佳 I/O 边界（以块为单位）。 读取和写入命令不应跨越最佳 I/O 边界以获得最佳性能。
+// 估计是每次IO的大小不要超过的边界, 0表示未报告
+uint32_t spdk_nvme_ns_get_optimal_io_boundary(struct spdk_nvme_ns *ns);
+const struct spdk_uuid *spdk_nvme_ns_get_uuid(const struct spdk_nvme_ns *ns);
+enum spdk_nvme_ns_flags {
+	SPDK_NVME_NS_DEALLOCATE_SUPPORTED	= 1 << 0, /**< The deallocate command is supported */
+	SPDK_NVME_NS_FLUSH_SUPPORTED		= 1 << 1, /**< The flush command is supported */
+	SPDK_NVME_NS_RESERVATION_SUPPORTED	= 1 << 2, /**< The reservation command is supported */
+	SPDK_NVME_NS_WRITE_ZEROES_SUPPORTED	= 1 << 3, /**< The write zeroes command is supported */
+	SPDK_NVME_NS_DPS_PI_SUPPORTED		= 1 << 4, /**< The end-to-end data protection is supported */
+	SPDK_NVME_NS_EXTENDED_LBA_SUPPORTED	= 1 << 5, /**< The extended lba format is supported,
+							      metadata is transferred as a contiguous
+							      part of the logical block that it is associated with */
+	SPDK_NVME_NS_WRITE_UNCORRECTABLE_SUPPORTED	= 1 << 6, /**< The write uncorrectable command is supported */
+	SPDK_NVME_NS_COMPARE_SUPPORTED		= 1 << 7, /**< The compare command is supported */
+};
+// 实验室的ssd比较、write zero、和flush都不支持
+uint32_t spdk_nvme_ns_get_flags(struct spdk_nvme_ns *ns);
+```
+
+### 使用spdk_nvme_ctrlr_cmd_io_raw 进行 deallocate
+
+```cpp
+	struct spdk_nvme_dsm_range* raw_ranges = spdk_zmalloc(0x1000, 0x1000, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (raw_ranges == NULL) {
+		printf("ERROR: write buffer allocation failed\n");
+		return;
+	}
+
+	for(int i = 0; i < RANGE_NUM; ++i) {
+		raw_ranges[i].attributes.raw = 0;
+		raw_ranges[i].starting_lba = START_LBA_FOR_RAW + i * LBA_LEVEL;
+		raw_ranges[i].length = LBA_LEVEL;
+	}
+	sequence.is_completed = 0;
+
+	struct spdk_nvme_cmd cmd = {0};
+	cmd.opc = SPDK_NVME_OPC_DATASET_MANAGEMENT;
+	cmd.nsid = spdk_nvme_ns_get_id(ns_entry->ns);
+	cmd.cdw10_bits.dsm.nr = RANGE_NUM - 1;
+	cmd.cdw11 = SPDK_NVME_DSM_ATTR_DEALLOCATE;
+	rc = spdk_nvme_ctrlr_cmd_io_raw(ns_entry->ctrlr, ns_entry->qpair, &cmd, raw_ranges,
+		LBA_NUM * sizeof(struct spdk_nvme_dsm_range), test_deallocate_common_complete, &sequence);
+	if (rc) {
+		printf("Error in nvme command completion, values may be inaccurate.\n");
+	}
+
+	while (!sequence.is_completed) {
+		spdk_nvme_qpair_process_completions(ns_entry->qpair, 0);
+	}
+	printf("spdk_nvme_ctrlr_cmd_io_raw over\n");
+	spdk_free(raw_ranges);
+```
 
 ## TODO
 
